@@ -32,3 +32,12 @@ class ExecOutcome(Base):
     fee_bps: Mapped[float] = mapped_column(Float)
     partial_fill: Mapped[int] = mapped_column(Integer)  # 0/1
     time_to_fill_ms: Mapped[int] = mapped_column(Integer)
+
+class BanditShadow(Base):
+    __tablename__ = "bandit_shadow"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    action_bandit: Mapped[int] = mapped_column(Integer)
+    action_baseline: Mapped[int] = mapped_column(Integer)
+    realized_cost_bps: Mapped[float] = mapped_column(Float)  # from baseline execution
