@@ -1,4 +1,4 @@
-import time, json
+import time, json, os
 from dotenv import load_dotenv
 
 from funding_arb.data.funding import FundingFeed, funding_per_day_from_8h
@@ -14,8 +14,12 @@ from funding_arb.loggers import log_funding, log_signal, log_position
 from funding_arb.llm.provider import get_provider
 from funding_arb.llm.prompt import build_messages
 
+API_KEY = os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_USDM_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_USDM_API_SECRET")
 OPEN_COOLDOWN_S = 20.0  # don’t allow a new OPEN within 20s of the last OPEN
 MIN_HOLD_S = 60.0   # must hold at least 60s before considering CLOSE
+
+assert API_KEY and API_SECRET, "Missing Binance API keys in .env"
 
 load_dotenv()
 
