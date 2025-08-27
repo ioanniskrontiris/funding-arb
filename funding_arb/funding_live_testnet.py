@@ -10,22 +10,23 @@ from funding_arb.notify import send_telegram, fmt_status, fmt_open, fmt_close, f
 from funding_arb.db import SessionLocal
 from funding_arb.loggers import log_funding, log_signal, log_position
 
-# NEW: local LLM
+# LLM (optional)
 from funding_arb.llm.provider import get_provider
 from funding_arb.llm.prompt import build_messages
 
-API_KEY = os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_USDM_API_KEY")
-API_SECRET = os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_USDM_API_SECRET")
-OPEN_COOLDOWN_S = 20.0  # don’t allow a new OPEN within 20s of the last OPEN
-MIN_HOLD_S = 60.0   # must hold at least 60s before considering CLOSE
-
-assert API_KEY and API_SECRET, "Missing Binance API keys in .env"
-
+# Load env early
 load_dotenv()
 
-OPEN_TH = 1.0     # fallback thresholds if LLM not available
-CLOSE_TH = 0.5
-LLM_PERIOD_S = 5.0  # call the LLM at most once every N seconds
+# Optional env read (don’t hard-fail; trader will error clearly if missing)
+API_KEY = os.getenv("BINANCE_API_KEY") or os.getenv("BINANCE_USDM_API_KEY")
+API_SECRET = os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_USDM_API_SECRET")
+
+OPEN_COOLDOWN_S = 20.0   # don’t allow a new OPEN within 20s of the last OPEN
+MIN_HOLD_S      = 60.0   # must hold at least 60s before considering CLOSE
+
+OPEN_TH     = 1.0        # fallback thresholds if LLM not available
+CLOSE_TH    = 0.5
+LLM_PERIOD_S = 5.0       # call the LLM at most once every N seconds
 
 def spread_bps_from_ob(bid: float, ask: float) -> float:
     mid = (bid + ask) / 2.0
@@ -51,7 +52,7 @@ def map_asset_to_testnet_symbol(ex, asset: str) -> str:
     return ex.symbols[0]
 
 def fallback_rule_intent(bpsd_raw: float, pos_open: bool) -> str:
-    """Deterministic backup: mirrors your earlier logic."""
+    # Deterministic backup: mirrors earlier logic.
     if not pos_open and abs(bpsd_raw) >= OPEN_TH:
         return "OPEN_SHORT" if bpsd_raw > 0 else "OPEN_LONG"
     if pos_open and abs(bpsd_raw) < CLOSE_TH:
@@ -81,11 +82,9 @@ def guardrails(intent: str, bpsd_raw: float, pos_open: bool, last_open_ts: float
     if intent == "CLOSE":
         if not pos_open:
             return "HOLD"
-        if abs(bpsd_raw) >= CLOSE_TH:
-            # still attractive carry → don't close yet
+        if abs(bpsd_raw) >= CLOSE_TH:  # still attractive carry → don't close yet
             return "HOLD"
-        if last_open_ts and (now - last_open_ts) < MIN_HOLD_S:
-            # too soon to close
+        if last_open_ts and (now - last_open_ts) < MIN_HOLD_S:  # too soon to close
             return "HOLD"
 
     return intent
@@ -102,7 +101,6 @@ def get_error_rate_safe(risk) -> float:
 
 def debug_print_llm(label, obj):
     try:
-        import json
         print(f"[LLM] {label}: " + json.dumps(obj, ensure_ascii=False))
     except Exception:
         print(f"[LLM] {label}: {obj}")
@@ -110,11 +108,11 @@ def debug_print_llm(label, obj):
 def main():
     print("Funding LIVE (testnet) — LLM supervisor + bandit + risk + telegram + logging")
 
-    fund = FundingFeed()
+    fund   = FundingFeed()
     bandit = BanditExecutor()
     trader = BinanceUSDM_TestnetTrader()
-    book = PaperBook()
-    risk = RiskState(RiskConfig(
+    book   = PaperBook()
+    risk   = RiskState(RiskConfig(
         max_notional=2000.0, max_runtime_minutes=180,
         stale_lob_ms=2000, max_error_rate=0.08, min_api_calls_for_rate=20,
         pnl_stop_loss_usdt=-5.0
@@ -126,7 +124,7 @@ def main():
     cached_decision = {"intent": "HOLD", "asset": "ETH/USDT", "confidence": 0.0, "rationale": "init"}
 
     # start ETH by default
-    asset = "ETH/USDT"
+    asset  = "ETH/USDT"
     symbol = map_asset_to_testnet_symbol(trader.ex, asset)
     trader.set_leverage(symbol, 1)
     floor = est_min_notional(trader.ex, symbol)
@@ -134,12 +132,12 @@ def main():
     print(f"Using testnet symbol: {symbol}")
     print(f"[info] using notional ≈ {notional:.2f} USDT (floor~{floor:.2f})")
 
-    perp_side = None
-    last_ts = time.time()
-    last_status_ts = 0.0
-    last_tele_ts = 0.0
-    last_open_ts = 0.0  # <-- LOCAL cooldown tracker
-    end_time = time.time() + 300  # ~5 minutes demo; extend on VPS
+    perp_side       = None
+    last_ts         = time.time()
+    last_status_ts  = 0.0
+    last_tele_ts    = 0.0
+    last_open_ts    = 0.0  # cooldown tracker
+    end_time        = time.time() + 300  # ~5 minutes demo; extend on VPS
 
     while time.time() < end_time:
         # 1) funding snapshot (ETH & BTC on mainnet)
@@ -148,22 +146,19 @@ def main():
         bpsd_eth = 1e4 * funding_per_day_from_8h(r8h_eth)
         bpsd_btc = 1e4 * funding_per_day_from_8h(r8h_btc)
 
-        # pick asset by strongest |bpsd|
+        # pick asset by strongest |bpsd|, unless FORCE_ASSET is set
         force = os.getenv("FORCE_ASSET")
-
-    if force in ("ETH/USDT", "BTC/USDT"):
-        asset = force
-        bpsd_raw = bpsd_eth if force == "ETH/USDT" else bpsd_btc
-        # helpful debug
-        print(f"[force] asset pinned via FORCE_ASSET={force}, bpsd={bpsd_raw:.2f}")
-    else:
-    # default: pick the stronger absolute carry
-        if abs(bpsd_btc) > abs(bpsd_eth):
-            asset = "BTC/USDT"; bpsd_raw = bpsd_btc
+        if force in ("ETH/USDT", "BTC/USDT"):
+            asset = force
+            bpsd_raw = bpsd_eth if force == "ETH/USDT" else bpsd_btc
+            print(f"[force] asset pinned via FORCE_ASSET={force}, bpsd={bpsd_raw:.2f}")
         else:
-            asset = "ETH/USDT"; bpsd_raw = bpsd_eth 
+            if abs(bpsd_btc) > abs(bpsd_eth):
+                asset = "BTC/USDT"; bpsd_raw = bpsd_btc
+            else:
+                asset = "ETH/USDT"; bpsd_raw = bpsd_eth
 
-        # switch testnet symbol only when flat
+        # switch testnet symbol only when flat (runs for both forced and auto)
         if not book.pos.is_open:
             new_symbol = map_asset_to_testnet_symbol(trader.ex, asset)
             if new_symbol != symbol:
@@ -178,9 +173,11 @@ def main():
             ob = trader.ex.fetch_order_book(symbol, limit=5)
             bids, asks = ob.get("bids", []), ob.get("asks", [])
         except Exception:
-            time.sleep(0.25); continue
+            time.sleep(0.25)
+            continue
         if not (bids and asks):
-            time.sleep(0.25); continue
+            time.sleep(0.25)
+            continue
 
         bid, ask = bids[0][0], asks[0][0]
         spread_bps = spread_bps_from_ob(bid, ask)
@@ -245,9 +242,11 @@ def main():
 
         # guardrails
         intent = guardrails(cached_decision["intent"], bpsd_raw, book.pos.is_open, last_open_ts)
-        # If model is unsure, do nothing
+
+        # confidence floor: if model is unsure, do nothing
         if cached_decision.get("confidence", 1.0) < 0.6:
             intent = "HOLD"
+
         # cooldown before opening again
         if intent in ("OPEN_SHORT", "OPEN_LONG") and (now - last_open_ts) < OPEN_COOLDOWN_S:
             debug_print_llm("cooldown_hold", {"intent": intent, "since_open_s": now - last_open_ts})
@@ -258,9 +257,10 @@ def main():
             intent = "OPEN_SHORT" if bpsd_raw > 0 else "OPEN_LONG"
             debug_print_llm("override_to_rule", {"intent": intent, "bpsd_raw": bpsd_raw})
 
-        # (optional) log simple signal row to your existing table
+        # log signal
         with SessionLocal() as s:
-            log_signal(s, symbol, intent, bpsd_raw); s.commit()
+            log_signal(s, symbol, intent, bpsd_raw)
+            s.commit()
 
         # 6) act
         if intent in ("OPEN_SHORT","OPEN_LONG") and not book.pos.is_open:
@@ -276,7 +276,7 @@ def main():
                 book.open_delta_neutral(symbol, notional_usdt=notional)
                 print(f"OPEN {perp_side} ({asset}): bpsd={bpsd_raw:.2f}, action={action}, status={real['status']}")
                 send_telegram(fmt_open(bpsd_raw, action, 0.0))
-                last_open_ts = time.time()  # <-- record successful open time
+                last_open_ts = time.time()
 
         elif intent == "CLOSE" and book.pos.is_open:
             side = "buy" if perp_side == "short" else "sell"
@@ -288,14 +288,19 @@ def main():
 
         # 7) status + persist once per second (+ telegram every 60s)
         if now - last_status_ts >= 1.0:
-            print(f"status: open={book.pos.is_open}, accrued={book.pos.accrued_funding_bps:.4f} bps, "
-                  f"est_pnl={book.realized_pnl_usdt():.6f} USDT, bpsd={bpsd_raw:.2f}, "
-                  f"side={perp_side}, asset={asset}, symbol={symbol}, "
-                  f"llm={'on' if llm.available() else 'off'}")
+            print(
+                f"status: open={book.pos.is_open}, accrued={book.pos.accrued_funding_bps:.4f} bps, "
+                f"est_pnl={book.realized_pnl_usdt():.6f} USDT, bpsd={bpsd_raw:.2f}, "
+                f"side={perp_side}, asset={asset}, symbol={symbol}, "
+                f"llm={'on' if llm.available() else 'off'}"
+            )
             with SessionLocal() as s:
-                log_funding(s, asset, (r8h_btc if asset=='BTC/USDT' else r8h_eth),
-                            funding_per_day_from_8h(r8h_btc if asset=='BTC/USDT' else r8h_eth),
-                            bpsd_raw)
+                log_funding(
+                    s, asset,
+                    (r8h_btc if asset=='BTC/USDT' else r8h_eth),
+                    funding_per_day_from_8h(r8h_btc if asset=='BTC/USDT' else r8h_eth),
+                    bpsd_raw
+                )
                 log_position(s, symbol, book.pos.is_open, book.pos.notional_usdt,
                              book.pos.accrued_funding_bps, book.realized_pnl_usdt())
                 s.commit()
@@ -308,11 +313,15 @@ def main():
         time.sleep(0.25)
 
     print("\n=== SUMMARY ===")
-    print(f"open={book.pos.is_open}, accrued={book.pos.accrued_funding_bps:.3f} bps, "
-          f"est_pnl={book.realized_pnl_usdt():.4f} USDT, side={perp_side}, symbol={symbol}")
-    send_telegram(f"SUMMARY open={book.pos.is_open}, "
-                  f"accrued={book.pos.accrued_funding_bps:.3f} bps, "
-                  f"est_pnl={book.realized_pnl_usdt():.4f} USDT, side={perp_side}, symbol={symbol}")
+    print(
+        f"open={book.pos.is_open}, accrued={book.pos.accrued_funding_bps:.3f} bps, "
+        f"est_pnl={book.realized_pnl_usdt():.4f} USDT, side={perp_side}, symbol={symbol}"
+    )
+    send_telegram(
+        f"SUMMARY open={book.pos.is_open}, "
+        f"accrued={book.pos.accrued_funding_bps:.3f} bps, "
+        f"est_pnl={book.realized_pnl_usdt():.4f} USDT, side={perp_side}, symbol={symbol}"
+    )
 
 if __name__ == "__main__":
     main()
