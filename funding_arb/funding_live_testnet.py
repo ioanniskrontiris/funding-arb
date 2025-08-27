@@ -24,8 +24,8 @@ API_SECRET = os.getenv("BINANCE_API_SECRET") or os.getenv("BINANCE_USDM_API_SECR
 OPEN_COOLDOWN_S = 20.0   # don’t allow a new OPEN within 20s of the last OPEN
 MIN_HOLD_S      = 60.0   # must hold at least 60s before considering CLOSE
 
-OPEN_TH     = 1.0        # fallback thresholds if LLM not available
-CLOSE_TH    = 0.5
+OPEN_TH = 0.5   # was 1.0
+CLOSE_TH = 0.25 # was 0.5
 LLM_PERIOD_S = 5.0       # call the LLM at most once every N seconds
 
 def spread_bps_from_ob(bid: float, ask: float) -> float:
@@ -244,7 +244,7 @@ def main():
         intent = guardrails(cached_decision["intent"], bpsd_raw, book.pos.is_open, last_open_ts)
 
         # confidence floor: if model is unsure, do nothing
-        if cached_decision.get("confidence", 1.0) < 0.6:
+        if cached_decision.get("confidence", 1.0) < 0.4:
             intent = "HOLD"
 
         # cooldown before opening again
