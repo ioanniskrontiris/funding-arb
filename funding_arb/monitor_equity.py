@@ -11,15 +11,16 @@ from funding_arb.notify import send_telegram
 
 load_dotenv()
 
-# --------- knobs ---------
-SNAPSHOT_EVERY_S = 60          # send a full equity snapshot this often
-POLL_EVERY_S = 5               # poll exchange this often
-ALERT_DROP_PCT = -0.005        # -0.5% since baseline → alert
-ALERT_GAIN_PCT = 0.010         # +1.0% since baseline → alert
-# -------------------------
+# --------- knobs (can be overridden via env) ---------
+SNAPSHOT_EVERY_S = int(os.getenv("EQ_SNAPSHOT_EVERY_S", 3600))  # full snapshot cadence (default: 1h)
+POLL_EVERY_S     = int(os.getenv("EQ_POLL_EVERY_S", 10))        # exchange poll cadence
+ALERT_DROP_PCT   = float(os.getenv("EQ_ALERT_DROP_PCT", -0.005))# -0.5% from baseline → alert & reset
+ALERT_GAIN_PCT   = float(os.getenv("EQ_ALERT_GAIN_PCT",  0.010))# +1.0% from baseline → alert & reset
+# -----------------------------------------------------
 
 
 def ts_utc() -> str:
+    # timezone-aware UTC, readable
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
 
 
@@ -34,14 +35,14 @@ def get_equity_state(trader: BinanceUSDM_TestnetTrader) -> Tuple[float, float, f
     """
     bal = trader.ex.fetch_balance(params={"type": "future"})
     equity = float(bal.get("total", {}).get("USDT", 0.0))
-    free = float(bal.get("free", {}).get("USDT", 0.0))
+    free   = float(bal.get("free",  {}).get("USDT", 0.0))
 
     positions = trader.ex.fetch_positions()
-    opens = []
+    opens: List[Dict] = []
     upnl_total = 0.0
     for p in positions:
         amt = float(p.get("contracts") or p.get("contractSize") or 0.0)
-        # ccxt uses positive/negative amt for side on some exchanges; on binance it's size>0 when open
+        # On Binance futures via ccxt, contracts>0 means an open position
         if abs(amt) > 0:
             upnl = float(p.get("unrealizedPnl", 0.0))
             opens.append({
@@ -100,12 +101,12 @@ def main():
         try:
             equity, free, upnl, positions = get_equity_state(trader)
         except Exception as e:
-            # Don’t spam Telegram for transient API errors; just print.
+            # Don’t spam Telegram for transient API errors; just print & retry.
             print(f"[monitor] fetch error: {e}")
             time.sleep(POLL_EVERY_S)
             continue
 
-        # status line for local logs
+        # terse status line for server logs
         print(f"[{ts_utc()}] equity={equity:.2f} free={free:.2f} upnl={upnl:.2f}")
 
         # position open/close alerts
@@ -120,7 +121,7 @@ def main():
                 send_telegram(f"🔴 Position CLOSED: {sym} (prev size {sz})")
         prev_pos_idx = cur_pos_idx
 
-        # equity change alerts
+        # equity change alerts relative to rolling baseline
         delta_pct = 0.0 if baseline_equity == 0 else (equity - baseline_equity) / baseline_equity
         if delta_pct <= ALERT_DROP_PCT:
             send_telegram(f"⚠️ Equity DOWN {fmt_pct(delta_pct)} from baseline ({baseline_at}). Baseline reset.")
@@ -131,12 +132,11 @@ def main():
             baseline_equity = equity
             baseline_at = ts_utc()
 
-        # periodic snapshot
+        # periodic snapshot (hourly by default)
         now = time.time()
         if now - last_snapshot >= SNAPSHOT_EVERY_S:
-            snap = snapshot_message(equity, free, upnl, positions,
-                                    0.0 if equity == baseline_equity else (equity - baseline_equity) / baseline_equity,
-                                    baseline_at)
+            delta_vs_base = 0.0 if equity == baseline_equity else (equity - baseline_equity) / baseline_equity
+            snap = snapshot_message(equity, free, upnl, positions, delta_vs_base, baseline_at)
             send_telegram(snap)
             last_snapshot = now
 
