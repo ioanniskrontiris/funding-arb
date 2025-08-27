@@ -1,123 +1,147 @@
 # funding_arb/monitor_equity.py
-import os, time, math
-from datetime import datetime
+import os
+import time
+from datetime import datetime, timezone
+from typing import Dict, List, Tuple
+
 from dotenv import load_dotenv
 
-from funding_arb.exec.real import BinanceUSDM_TestnetTrader  # we’re on testnet
+from funding_arb.exec.real import BinanceUSDM_TestnetTrader
 from funding_arb.notify import send_telegram
 
 load_dotenv()
 
-SEND_EVERY_SEC = int(os.getenv("EQUITY_NOTIFY_EVERY_SEC", "300"))  # default 5 min
+# --------- knobs ---------
+SNAPSHOT_EVERY_S = 60          # send a full equity snapshot this often
+POLL_EVERY_S = 5               # poll exchange this often
+ALERT_DROP_PCT = -0.005        # -0.5% since baseline → alert
+ALERT_GAIN_PCT = 0.010         # +1.0% since baseline → alert
+# -------------------------
 
-def _fmt_usd(x):
-    try:
-        return f"{float(x):,.2f}"
-    except Exception:
-        return str(x)
 
-def get_equity_snapshot(trader):
+def ts_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def fmt_pct(x: float) -> str:
+    return f"{x*100:.3f}%"
+
+
+def get_equity_state(trader: BinanceUSDM_TestnetTrader) -> Tuple[float, float, float, List[Dict]]:
     """
-    Returns a dict with:
-      - balance_free
-      - balance_total
-      - unrealized_pnl
-      - equity (balance_total + unrealized_pnl)
-      - positions: list of small dicts
-    Robust to minor ccxt schema differences.
+    Returns: equity, free, total_unrealized_pnl, open_positions
+    open_positions: [{"symbol": "...", "contracts": float, "upnl": float}]
     """
-    ex = trader.ex
-    bal = ex.fetch_balance() or {}
-    usdt = bal.get("USDT") or bal.get("USDC") or {}
-    free = float(usdt.get("free") or 0.0)
-    total = float(usdt.get("total") or (free + float(usdt.get("used") or 0.0)))
+    bal = trader.ex.fetch_balance(params={"type": "future"})
+    equity = float(bal.get("total", {}).get("USDT", 0.0))
+    free = float(bal.get("free", {}).get("USDT", 0.0))
 
-    unrealized_total = 0.0
-    positions = []
-    try:
-        # If you want to limit to a couple of symbols, set FILTER_SYMBOLS in env: "BTC/USDT:USDT,ETH/USDT:USDT"
-        filt = [s.strip() for s in os.getenv("FILTER_SYMBOLS","").split(",") if s.strip()]
-        raw_positions = ex.fetch_positions() or []
-        for p in raw_positions:
-            sym = p.get("symbol") or p.get("info",{}).get("symbol")
-            if filt and sym not in filt:
-                continue
-            upnl = p.get("unrealizedPnl")
-            if upnl is None:
-                upnl = p.get("info",{}).get("unRealizedProfit")
-            try:
-                upnl = float(upnl or 0.0)
-            except Exception:
-                upnl = 0.0
-            size = p.get("contracts") or p.get("contractsSize") or p.get("info",{}).get("positionAmt")
-            try:
-                size = float(size or 0.0)
-            except Exception:
-                size = 0.0
-            unrealized_total += upnl
-            positions.append({"symbol": sym, "upnl": upnl, "size": size})
-    except Exception:
-        pass
+    positions = trader.ex.fetch_positions()
+    opens = []
+    upnl_total = 0.0
+    for p in positions:
+        amt = float(p.get("contracts") or p.get("contractSize") or 0.0)
+        # ccxt uses positive/negative amt for side on some exchanges; on binance it's size>0 when open
+        if abs(amt) > 0:
+            upnl = float(p.get("unrealizedPnl", 0.0))
+            opens.append({
+                "symbol": p.get("symbol"),
+                "contracts": amt,
+                "upnl": upnl,
+            })
+            upnl_total += upnl
 
-    equity = total + unrealized_total
-    return {
-        "balance_free": free,
-        "balance_total": total,
-        "unrealized_pnl": unrealized_total,
-        "equity": equity,
-        "positions": positions,
-    }
+    return equity, free, upnl_total, opens
 
-def fmt_equity_msg(snap, base=None):
-    # base is the equity at script start, to show change
-    eq = snap["equity"]
-    free = snap["balance_free"]
-    upnl = snap["unrealized_pnl"]
-    pos_lines = []
-    for p in snap["positions"]:
-        if not p["symbol"]:
-            continue
-        pos_lines.append(f"• {p['symbol']}: uPNL {_fmt_usd(p['upnl'])}, size {p['size']}")
-    delta_line = ""
-    if base is not None:
-        d = eq - base
-        sign = "▲" if d >= 0 else "▼"
-        pct = (d / base * 100.0) if base and base != 0 else 0.0
-        delta_line = f"\nΔ since start: {sign} {_fmt_usd(d)} ({pct:+.3f}%)"
 
-    body = (
-        f"⏱ {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n"
-        f"Equity: {_fmt_usd(eq)} USDT\n"
-        f"Free:   {_fmt_usd(free)} USDT\n"
-        f"uPNL:   {_fmt_usd(upnl)} USDT"
-        f"{delta_line}"
-    )
-    if pos_lines:
-        body += "\nPositions:\n" + "\n".join(pos_lines)
-    return body
+def snapshot_message(equity: float, free: float, upnl: float,
+                     positions: List[Dict], delta_pct_since_baseline: float,
+                     started_at: str) -> str:
+    lines = []
+    lines.append("🔔 Equity snapshot")
+    lines.append(f"⏱ {ts_utc()}")
+    lines.append(f"Equity: {equity:,.2f} USDT")
+    lines.append(f"Free:   {free:,.2f} USDT")
+    lines.append(f"uPNL:   {upnl:,.2f} USDT")
+    arrow = "▲" if delta_pct_since_baseline >= 0 else "▼"
+    lines.append(f"Δ since start ({started_at}): {arrow} {fmt_pct(delta_pct_since_baseline)}")
+    lines.append("Positions:")
+    if positions:
+        for p in positions:
+            lines.append(f"• {p['symbol']}: uPNL {p['upnl']:.2f}, size {p['contracts']}")
+    else:
+        lines.append("• (none)")
+    return "\n".join(lines)
+
+
+def positions_index(positions: List[Dict]) -> Dict[str, float]:
+    """symbol -> contracts"""
+    return {p["symbol"]: float(p["contracts"]) for p in positions}
+
 
 def main():
-    # ensure keys exist (env already set for your trader)
-    assert (os.getenv("BINANCE_USDM_API_KEY") or os.getenv("BINANCE_API_KEY")), \
-        "Missing Binance API key env vars"
-    assert (os.getenv("BINANCE_USDM_API_SECRET") or os.getenv("BINANCE_API_SECRET")), \
-        "Missing Binance API secret env vars"
-
+    print("📡 Equity monitor starting…")
     trader = BinanceUSDM_TestnetTrader()
 
-    # baseline on start
-    start_snap = get_equity_snapshot(trader)
-    base_equity = start_snap["equity"]
-    send_telegram("🔔 Equity monitor started.\n" + fmt_equity_msg(start_snap, base=base_equity))
+    # initial state
+    equity, free, upnl, positions = get_equity_state(trader)
+    baseline_equity = equity
+    baseline_at = ts_utc()
+    last_snapshot = 0.0
+    prev_pos_idx = positions_index(positions)
 
-    last_sent = 0.0
+    # first snapshot
+    send_telegram(
+        snapshot_message(equity, free, upnl, positions, 0.0, baseline_at)
+    )
+    print("First snapshot sent.")
+
     while True:
+        try:
+            equity, free, upnl, positions = get_equity_state(trader)
+        except Exception as e:
+            # Don’t spam Telegram for transient API errors; just print.
+            print(f"[monitor] fetch error: {e}")
+            time.sleep(POLL_EVERY_S)
+            continue
+
+        # status line for local logs
+        print(f"[{ts_utc()}] equity={equity:.2f} free={free:.2f} upnl={upnl:.2f}")
+
+        # position open/close alerts
+        cur_pos_idx = positions_index(positions)
+        # opened
+        for sym, sz in cur_pos_idx.items():
+            if sym not in prev_pos_idx:
+                send_telegram(f"🟢 Position OPENED: {sym} size {sz}")
+        # closed
+        for sym, sz in prev_pos_idx.items():
+            if sym not in cur_pos_idx:
+                send_telegram(f"🔴 Position CLOSED: {sym} (prev size {sz})")
+        prev_pos_idx = cur_pos_idx
+
+        # equity change alerts
+        delta_pct = 0.0 if baseline_equity == 0 else (equity - baseline_equity) / baseline_equity
+        if delta_pct <= ALERT_DROP_PCT:
+            send_telegram(f"⚠️ Equity DOWN {fmt_pct(delta_pct)} from baseline ({baseline_at}). Baseline reset.")
+            baseline_equity = equity
+            baseline_at = ts_utc()
+        elif delta_pct >= ALERT_GAIN_PCT:
+            send_telegram(f"🚀 Equity UP {fmt_pct(delta_pct)} from baseline ({baseline_at}). Baseline reset.")
+            baseline_equity = equity
+            baseline_at = ts_utc()
+
+        # periodic snapshot
         now = time.time()
-        if now - last_sent >= SEND_EVERY_SEC:
-            snap = get_equity_snapshot(trader)
-            send_telegram(fmt_equity_msg(snap, base=base_equity))
-            last_sent = now
-        time.sleep(2)
+        if now - last_snapshot >= SNAPSHOT_EVERY_S:
+            snap = snapshot_message(equity, free, upnl, positions,
+                                    0.0 if equity == baseline_equity else (equity - baseline_equity) / baseline_equity,
+                                    baseline_at)
+            send_telegram(snap)
+            last_snapshot = now
+
+        time.sleep(POLL_EVERY_S)
+
 
 if __name__ == "__main__":
     main()

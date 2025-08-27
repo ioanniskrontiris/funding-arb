@@ -1,5 +1,7 @@
+# funding_arb/testnet_live_demo.py
 import time
 from dotenv import load_dotenv
+
 from funding_arb.exec.bandit_exec import BanditExecutor
 from funding_arb.exec.real import BinanceUSDM_TestnetTrader
 from funding_arb.db import SessionLocal
@@ -22,9 +24,9 @@ def est_min_notional(ex, symbol: str) -> float:
     min_amt = (m.get("limits", {}).get("amount", {}) or {}).get("min") or 0.0
     ob = ex.fetch_order_book(symbol, limit=5)
     bids, asks = ob.get("bids", []), ob.get("asks", [])
-    mid = (bids[0][0] + asks[0][0]) / 2.0 if bids and asks else 0.0
+    mid = (bids and asks) and (bids[0][0] + asks[0][0]) / 2.0 or 0.0
     approx = float(min_amt) * float(mid) if mid else 0.0
-    return max(20.0, approx)  # binance testnet opening floor
+    return max(20.0, approx)
 
 def main():
     print("TESTNET LIVE (futures) — bandit chooses actions, real orders on testnet")
@@ -36,7 +38,7 @@ def main():
     trader.set_leverage(symbol, leverage=1)
 
     floor = est_min_notional(trader.ex, symbol)
-    notional = max(25.0, floor * 1.05)   # safe above min
+    notional = max(25.0, floor * 1.05)
     print(f"[info] using notional ≈ {notional:.2f} USDT (floor~{floor:.2f})")
 
     side = "buy"
@@ -48,19 +50,21 @@ def main():
             ob = trader.ex.fetch_order_book(symbol, limit=5)
         except Exception as e:
             print("order book error:", e)
-            time.sleep(0.25); continue
+            time.sleep(0.25)
+            continue
 
         bids, asks = ob.get("bids", []), ob.get("asks", [])
         if not (bids and asks):
-            time.sleep(0.25); continue
+            time.sleep(0.25)
+            continue
 
         lob = {"bids": bids, "asks": asks, "latency_ms": 0}
-
         action, ts_ms, sim = bandit.decide_and_execute(lob, symbol, side=side, deadline_ms=deadline_ms)
         if action is None:
-            time.sleep(0.25); continue
+            time.sleep(0.25)
+            continue
         if action == 3:
-            action = 2  # don't noop in live demo
+            action = 2  # avoid noop in live demo
 
         real = trader.execute_action(action, symbol, side, notional, deadline_ms=deadline_ms, reduce_only=False)
 
