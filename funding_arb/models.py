@@ -41,3 +41,33 @@ class BanditShadow(Base):
     action_bandit: Mapped[int] = mapped_column(Integer)
     action_baseline: Mapped[int] = mapped_column(Integer)
     realized_cost_bps: Mapped[float] = mapped_column(Float)  # from baseline execution
+
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Integer, Float, String, BigInteger
+
+class FundingTick(Base):
+    __tablename__ = "funding_ticks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    rate_8h: Mapped[float] = mapped_column(Float)
+    rate_day: Mapped[float] = mapped_column(Float)
+    bps_day_net: Mapped[float] = mapped_column(Float)
+
+class SignalTick(Base):
+    __tablename__ = "signal_ticks"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    decision: Mapped[str] = mapped_column(String(16))
+    bps_day_net: Mapped[float] = mapped_column(Float)
+
+class PositionSnap(Base):
+    __tablename__ = "position_snaps"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    ts_ms: Mapped[int] = mapped_column(BigInteger, index=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    is_open: Mapped[int] = mapped_column(Integer)          # 0/1
+    notional_usdt: Mapped[float] = mapped_column(Float)
+    accrued_bps: Mapped[float] = mapped_column(Float)
+    est_pnl_usdt: Mapped[float] = mapped_column(Float)
