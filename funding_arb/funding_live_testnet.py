@@ -149,10 +149,19 @@ def main():
         bpsd_btc = 1e4 * funding_per_day_from_8h(r8h_btc)
 
         # pick asset by strongest |bpsd|
+        force = os.getenv("FORCE_ASSET")
+
+    if force in ("ETH/USDT", "BTC/USDT"):
+        asset = force
+        bpsd_raw = bpsd_eth if force == "ETH/USDT" else bpsd_btc
+        # helpful debug
+        print(f"[force] asset pinned via FORCE_ASSET={force}, bpsd={bpsd_raw:.2f}")
+    else:
+    # default: pick the stronger absolute carry
         if abs(bpsd_btc) > abs(bpsd_eth):
             asset = "BTC/USDT"; bpsd_raw = bpsd_btc
         else:
-            asset = "ETH/USDT"; bpsd_raw = bpsd_eth
+            asset = "ETH/USDT"; bpsd_raw = bpsd_eth 
 
         # switch testnet symbol only when flat
         if not book.pos.is_open:
